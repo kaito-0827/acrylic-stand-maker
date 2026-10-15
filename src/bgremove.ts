@@ -191,6 +191,17 @@ export function removeBackground(src: Uint8ClampedArray, W: number, H: number, o
   }
 
   // 5) JPEGノイズ等の小さな浮島を除去
+  removeIslands(alpha, W, H);
+
+  for (let i = 0; i < N; i++) d[i * 4 + 3] = Math.round(d[i * 4 + 3] * alpha[i]);
+  return { data: d, bg: B };
+}
+
+/** α≥0.5 の連結成分のうち、ごく小さいもの(JPEGノイズ等)を透明にする */
+function removeIslands(alpha: Float32Array, W: number, H: number) {
+  const N = W * H;
+  const stack = new Int32Array(N);
+  let sp = 0;
   const minIsland = Math.max(9, Math.round(N * 0.00005));
   const seen = new Uint8Array(N);
   const island: number[] = [];
@@ -223,7 +234,94 @@ export function removeBackground(src: Uint8ClampedArray, W: number, H: number, o
       }
     }
   }
+}
 
-  for (let i = 0; i < N; i++) d[i * 4 + 3] = Math.round(d[i * 4 + 3] * alpha[i]);
-  return { data: d, bg: B };
+/** 半径 r のボックスブラー(縦横分離・累積和)。端は範囲内の画素だけで平均 */
+function boxBlur(src: Float32Array, W: number, H: number, r: number): Float32Array {
+  const tmp = new Float32Array(W * H);
+  const out = new Float32Array(W * H);
+  const line = new Float64Array(Math.max(W, H) + 1);
+  for (let y = 0; y < H; y++) {
+    const o = y * W;
+    for (let x = 0; x < W; x++) line[x + 1] = line[x] + src[o + x];
+    for (let x = 0; x < W; x++) {
+      const a = Math.max(0, x - r), b = Math.min(W, x + r + 1);
+      tmp[o + x] = (line[b] - line[a]) / (b - a);
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) line[y + 1] = line[y] + tmp[y * W + x];
+    for (let y = 0; y < H; y++) {
+      const a = Math.max(0, y - r), b = Math.min(H, y + r + 1);
+      out[y * W + x] = (line[b] - line[a]) / (b - a);
+    }
+  }
+  return out;
+}
+
+/**
+ * AIマスクを画像に適用する。背景が単色でないので、境界の色は Blur-Fusion
+ * (Forte & Pitié 2021, 近傍の前景/背景の平均色から前景色を推定) で背景の混ざりを除く
+ */
+export function applyMatte(src: Uint8ClampedArray, W: number, H: number, matte: Float32Array): Uint8ClampedArray {
+  const N = W * H;
+  const alpha = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const a = matte[i] * (src[i * 4 + 3] / 255);
+    alpha[i] = a < 0.04 ? 0 : a > 0.96 ? 1 : a;
+  }
+  removeIslands(alpha, W, H);
+
+  const I = [0, 1, 2].map((ch) => {
+    const c = new Float32Array(N);
+    for (let i = 0; i < N; i++) c[i] = src[i * 4 + ch] / 255;
+    return c;
+  });
+  const scale = Math.max(W, H) / 1024;
+  const blurA = (r: number) => boxBlur(alpha, W, H, r);
+  const estimate = (F: Float32Array[], B: Float32Array[], r: number) => {
+    const bA = blurA(r);
+    const nF: Float32Array[] = [], nB: Float32Array[] = [];
+    const fa = new Float32Array(N), b1a = new Float32Array(N);
+    for (let ch = 0; ch < 3; ch++) {
+      for (let i = 0; i < N; i++) {
+        fa[i] = F[ch][i] * alpha[i];
+        b1a[i] = B[ch][i] * (1 - alpha[i]);
+      }
+      const bF = boxBlur(fa, W, H, r), bB = boxBlur(b1a, W, H, r);
+      const f = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        bF[i] /= bA[i] + 1e-5;
+        bB[i] /= 1 - bA[i] + 1e-5;
+        const a = alpha[i];
+        const v = bF[i] + a * (I[ch][i] - a * bF[i] - (1 - a) * bB[i]);
+        f[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+      }
+      nF.push(f);
+      nB.push(bB);
+    }
+    return [nF, nB] as const;
+  };
+  let [F, B] = estimate(I, I, Math.max(8, Math.round(90 * scale)));
+  [F] = estimate(F, B, Math.max(3, Math.round(6 * scale)));
+
+  const d = new Uint8ClampedArray(src);
+  for (let i = 0; i < N; i++) {
+    const a = alpha[i];
+    d[i * 4 + 3] = Math.round(a * 255);
+    if (a > 0 && a < 1) for (let ch = 0; ch < 3; ch++) d[i * 4 + ch] = Math.round(F[ch][i] * 255);
+  }
+  return d;
+}
+
+/** 外周の画素のうち背景色 B に近いものの割合(単色背景かどうかの目安) */
+export function borderMatchRatio(d: Uint8ClampedArray, W: number, H: number, B: [number, number, number], tol: number): number {
+  let n = 0, hit = 0;
+  const test = (i: number) => {
+    n++;
+    if (d[i * 4 + 3] < 250 || colorDist(d[i * 4], d[i * 4 + 1], d[i * 4 + 2], B[0], B[1], B[2]) < tol) hit++;
+  };
+  for (let x = 0; x < W; x++) { test(x); test((H - 1) * W + x); }
+  for (let y = 1; y < H - 1; y++) { test(y * W); test(y * W + W - 1); }
+  return n ? hit / n : 1;
 }

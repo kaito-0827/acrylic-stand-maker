@@ -1,6 +1,7 @@
 import "./style.css";
 import { buildGeometry, planGrid, type StandGeometry, type StandParams } from "./geometry";
-import { estimateBackground, removeBackground } from "./bgremove";
+import { applyMatte, borderMatchRatio, estimateBackground, removeBackground } from "./bgremove";
+import { aiBackendLabel, predictMatte, type AiProgress } from "./aimatte";
 import { buildAi, buildEps, loopsToSvgPath, type Cmyk, type ExportOptions, type Raster } from "./export";
 
 // ---------------------------------------------------------------- 状態
@@ -34,6 +35,10 @@ const state = {
   removeBg: false,
   bgTolerance: 12,
   removeEnclosed: false,
+  bgMode: "color" as "color" | "ai",
+  aiMatte: null as Float32Array | null, // state.original に対するAIマスク
+  aiRun: 0, // 実行中のAI処理の世代(画像を差し替えたら古い結果を捨てる)
+  bgComplex: false, // 外周が単色でなさそう
   bgColor: null as [number, number, number] | null,
   cutColor: "red",
   cutWidthPt: 0.3,
@@ -91,17 +96,28 @@ app.innerHTML = `
         <div class="drop-sub">背景透過PNG推奨</div>
       </label>
       <button class="link" id="sample" type="button">サンプル画像で試す</button>
-      <label class="check"><input type="checkbox" id="removeBg" /> 背景を透過する（単色の背景）</label>
+      <label class="check"><input type="checkbox" id="removeBg" /> 背景を透過する</label>
       <div id="bgOpts" hidden>
-        <div class="field">
-          <span>背景色<small>画像の外周から自動判定</small></span>
-          <span class="swatch" id="bgSwatch"></span>
+        <div class="seg" role="radiogroup" aria-label="背景透過の方式">
+          <label><input type="radio" name="bgMode" value="color" checked />単色（高速）<small>イラスト・単色背景</small></label>
+          <label><input type="radio" name="bgMode" value="ai" />AI<small>写真・複雑な背景</small></label>
         </div>
-        <div class="field">
-          <span>許容差<small>背景が残る→上げる／絵柄が欠ける→下げる</small></span>
-          <span class="num"><input type="range" id="tol" min="3" max="40" value="12" /><em id="tolVal">12</em></span>
+        <div id="colorOpts">
+          <div id="complexHint" class="hintbox" hidden>背景が単色ではないようです。<button class="link" id="toAi" type="button">AIモードを試す</button></div>
+          <div class="field">
+            <span>背景色<small>画像の外周から自動判定</small></span>
+            <span class="swatch" id="bgSwatch"></span>
+          </div>
+          <div class="field">
+            <span>許容差<small>背景が残る→上げる／絵柄が欠ける→下げる</small></span>
+            <span class="num"><input type="range" id="tol" min="3" max="40" value="12" /><em id="tolVal">12</em></span>
+          </div>
+          <label class="check"><input type="checkbox" id="removeEnclosed" /><span>囲まれた背景も透過<small class="hint">腕のすき間など。背景と同じ色の服も消えることがあります</small></span></label>
         </div>
-        <label class="check"><input type="checkbox" id="removeEnclosed" /><span>囲まれた背景も透過<small class="hint">腕のすき間など。背景と同じ色の服も消えることがあります</small></span></label>
+        <div id="aiOpts" hidden>
+          <div class="progress" id="aiBar" hidden><div></div></div>
+          <div class="ai-status" id="aiStatus"></div>
+        </div>
       </div>
       <div id="imgInfo" class="info"></div>
     </section>
@@ -181,14 +197,86 @@ function removeBg(src: HTMLCanvasElement) {
 
 function showBgOpts() {
   $("bgOpts").hidden = !state.removeBg;
+  $("colorOpts").hidden = state.bgMode !== "color";
+  $("aiOpts").hidden = state.bgMode !== "ai";
+  $("complexHint").hidden = !state.bgComplex;
   const sw = $("bgSwatch");
   sw.style.background = state.bgColor ? `rgb(${state.bgColor.join(",")})` : "transparent";
   sw.textContent = state.bgColor ? "" : "判定できません";
 }
 
+/** AIマスクを適用したキャンバスを作る */
+function applyAi(src: HTMLCanvasElement, matte: Float32Array) {
+  const c = document.createElement("canvas");
+  c.width = src.width;
+  c.height = src.height;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(src, 0, 0);
+  const id = ctx.getImageData(0, 0, c.width, c.height);
+  id.data.set(applyMatte(id.data, c.width, c.height, matte));
+  ctx.putImageData(id, 0, 0);
+  return c;
+}
+
+function setAiStatus(text: string, opt: { error?: boolean; progress?: number | "indeterminate" } = {}) {
+  const st = $("aiStatus");
+  st.textContent = text;
+  st.classList.toggle("err", !!opt.error);
+  const bar = $("aiBar");
+  bar.hidden = opt.progress === undefined;
+  bar.classList.toggle("indeterminate", opt.progress === "indeterminate");
+  (bar.firstElementChild as HTMLElement).style.width = typeof opt.progress === "number" ? `${Math.round(opt.progress * 100)}%` : "";
+}
+
+const MB = (n: number) => (n / 1024 / 1024).toFixed(0);
+
+async function runAi() {
+  const original = state.original;
+  if (!original) return;
+  const run = ++state.aiRun;
+  const t0 = performance.now();
+  const onProgress = (p: AiProgress) => {
+    if (run !== state.aiRun) return;
+    if (p.phase === "download") {
+      setAiStatus(
+        p.total ? `AIモデルをダウンロード中… ${MB(p.loaded)} / ${MB(p.total)} MB（初回のみ）` : `AIモデルをダウンロード中… ${MB(p.loaded)} MB（初回のみ）`,
+        { progress: p.total ? p.loaded / p.total : "indeterminate" },
+      );
+    } else if (p.phase === "init") {
+      setAiStatus("AIモデルを準備中…", { progress: "indeterminate" });
+    } else {
+      setAiStatus("背景を解析中…", { progress: "indeterminate" });
+    }
+  };
+  try {
+    const { matte, backend } = await predictMatte(original, onProgress);
+    if (run !== state.aiRun || original !== state.original) return;
+    state.aiMatte = matte;
+    setAiStatus(`AIで背景を透過しました（${aiBackendLabel(backend)}・${((performance.now() - t0) / 1000).toFixed(1)}秒）。処理はすべてこの端末内で行われます`);
+    applySource();
+  } catch (e) {
+    if (run !== state.aiRun) return;
+    console.error(e);
+    setAiStatus(`AI処理に失敗しました: ${(e as Error).message}`, { error: true });
+  }
+}
+
 function applySource() {
   if (!state.original) return;
-  state.source = state.removeBg && state.bgColor ? removeBg(state.original) : state.original;
+  if (!state.removeBg) {
+    state.source = state.original;
+  } else if (state.bgMode === "ai") {
+    if (!state.aiMatte) {
+      // 結果が出るまでは元画像のまま
+      state.source = state.original;
+      schedule();
+      runAi();
+      return;
+    }
+    state.source = applyAi(state.original, state.aiMatte);
+  } else {
+    state.source = state.bgColor ? removeBg(state.original) : state.original;
+  }
   schedule();
 }
 
@@ -200,7 +288,12 @@ function loadImageFile(file: File) {
     state.fileName = file.name.replace(/\.[^.]+$/, "") || "acrylic-stand";
     // 外周が不透明(JPEGなど)なら背景色を推定して透過を自動でON
     const o = state.original;
-    state.bgColor = estimateBackground(o.getContext("2d")!.getImageData(0, 0, o.width, o.height).data, o.width, o.height);
+    const od = o.getContext("2d")!.getImageData(0, 0, o.width, o.height).data;
+    state.bgColor = estimateBackground(od, o.width, o.height);
+    state.bgComplex = !!state.bgColor && borderMatchRatio(od, o.width, o.height, state.bgColor, 20) < 0.6;
+    state.aiMatte = null;
+    state.aiRun++;
+    setAiStatus("");
     state.removeBg = !!state.bgColor;
     $<HTMLInputElement>("removeBg").checked = state.removeBg;
     showBgOpts();
@@ -269,6 +362,10 @@ function makeSample() {
   state.original = c;
   state.fileName = "sample";
   state.bgColor = null;
+  state.bgComplex = false;
+  state.aiMatte = null;
+  state.aiRun++;
+  setAiStatus("");
   state.removeBg = false;
   $<HTMLInputElement>("removeBg").checked = false;
   showBgOpts();
@@ -451,6 +548,16 @@ $<HTMLInputElement>("removeBg").addEventListener("change", (e) => {
   showBgOpts();
   applySource();
 });
+function setBgMode(mode: "color" | "ai") {
+  state.bgMode = mode;
+  document.querySelectorAll<HTMLInputElement>('input[name="bgMode"]').forEach((r) => (r.checked = r.value === mode));
+  showBgOpts();
+  applySource();
+}
+document.querySelectorAll<HTMLInputElement>('input[name="bgMode"]').forEach((r) =>
+  r.addEventListener("change", () => r.checked && setBgMode(r.value as "color" | "ai")),
+);
+$("toAi").addEventListener("click", () => setBgMode("ai"));
 let tolTimer = 0;
 $<HTMLInputElement>("tol").addEventListener("input", (e) => {
   state.bgTolerance = +(e.target as HTMLInputElement).value;
