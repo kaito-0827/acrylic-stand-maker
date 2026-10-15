@@ -91,6 +91,7 @@ async function createSession(ort: typeof Ort, device: "webgpu" | "wasm", onProgr
 async function load(onProgress: (p: AiProgress) => void): Promise<Loaded> {
   const ort = await import("onnxruntime-web/webgpu");
   let device = await pickBackend();
+  ort.env.logLevel = "error"; // 未使用initializerの削除通知などWarningでコンソールが埋まるのを防ぐ
   // 最初からCPUならUIを止めないようワーカーで実行(初期化後は切り替えられない)。
   // スレッドが使えるのはCOOP/COEPで分離されているときだけ
   ort.env.wasm.proxy = device === "wasm";
