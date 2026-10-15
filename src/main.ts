@@ -1,6 +1,6 @@
 import "./style.css";
 import { buildGeometry, planGrid, type StandGeometry, type StandParams } from "./geometry";
-import { applyMatte, borderMatchRatio, estimateBackground, removeBackground } from "./bgremove";
+import { applyMatte, borderMatchRatio, eraseRegion, estimateBackground, removeBackground } from "./bgremove";
 import { aiBackendLabel, predictMatte, type AiProgress } from "./aimatte";
 import { buildAi, buildEps, loopsToSvgPath, type Cmyk, type ExportOptions, type Raster } from "./export";
 
@@ -40,6 +40,8 @@ const state = {
   aiRun: 0, // 実行中のAI処理の世代(画像を差し替えたら古い結果を捨てる)
   bgComplex: false, // 外周が単色でなさそう
   bgColor: null as [number, number, number] | null,
+  erasePts: [] as { x: number; y: number }[], // クリックで消した領域の起点(元画像の画素座標)
+  eraseMode: false,
   cutColor: "red",
   cutWidthPt: 0.3,
   includeBase: true,
@@ -117,6 +119,15 @@ app.innerHTML = `
         <div id="aiOpts" hidden>
           <div class="progress" id="aiBar" hidden><div></div></div>
           <div class="ai-status" id="aiStatus"></div>
+        </div>
+        <div class="erase">
+          <button class="sub-btn" id="eraseToggle" type="button" aria-pressed="false">残った背景をクリックで消す</button>
+          <small class="hint">すき間から見える背景など、自動で消えなかった部分をプレビュー上でクリック</small>
+          <div class="erase-row" id="eraseRow" hidden>
+            <span id="eraseCount"></span>
+            <button class="link" id="eraseUndo" type="button">1つ戻す</button>
+            <button class="link" id="eraseClear" type="button">全部戻す</button>
+          </div>
         </div>
       </div>
       <div id="imgInfo" class="info"></div>
@@ -277,7 +288,42 @@ function applySource() {
   } else {
     state.source = state.bgColor ? removeBg(state.original) : state.original;
   }
+  if (state.removeBg && state.erasePts.length) state.source = applyErase(state.source);
   schedule();
+}
+
+/** クリックで指定した領域を透過したキャンバスを作る */
+function applyErase(src: HTMLCanvasElement) {
+  const o = state.original!;
+  const W = o.width, H = o.height;
+  const orig = o.getContext("2d")!.getImageData(0, 0, W, H).data;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(src, 0, 0);
+  const id = ctx.getImageData(0, 0, W, H);
+  let cur: Uint8ClampedArray = id.data;
+  for (const p of state.erasePts) cur = eraseRegion(cur, orig, W, H, p.x, p.y, state.bgTolerance);
+  id.data.set(cur);
+  ctx.putImageData(id, 0, 0);
+  return c;
+}
+
+function showErase() {
+  const btn = $("eraseToggle");
+  btn.classList.toggle("on", state.eraseMode);
+  btn.setAttribute("aria-pressed", String(state.eraseMode));
+  btn.textContent = state.eraseMode ? "クリックで消す: ON（もう一度押すと終了）" : "残った背景をクリックで消す";
+  $("canvas").classList.toggle("erasing", state.eraseMode);
+  $("eraseRow").hidden = !state.erasePts.length;
+  $("eraseCount").textContent = `${state.erasePts.length}か所を透過`;
+}
+
+function resetErase() {
+  state.erasePts = [];
+  state.eraseMode = false;
+  showErase();
 }
 
 function loadImageFile(file: File) {
@@ -294,6 +340,7 @@ function loadImageFile(file: File) {
     state.aiMatte = null;
     state.aiRun++;
     setAiStatus("");
+    resetErase();
     state.removeBg = !!state.bgColor;
     $<HTMLInputElement>("removeBg").checked = state.removeBg;
     showBgOpts();
@@ -366,6 +413,7 @@ function makeSample() {
   state.aiMatte = null;
   state.aiRun++;
   setAiStatus("");
+  resetErase();
   state.removeBg = false;
   $<HTMLInputElement>("removeBg").checked = false;
   showBgOpts();
@@ -567,6 +615,34 @@ $<HTMLInputElement>("tol").addEventListener("input", (e) => {
 });
 $<HTMLInputElement>("removeEnclosed").addEventListener("change", (e) => {
   state.removeEnclosed = (e.target as HTMLInputElement).checked;
+  applySource();
+});
+$("eraseToggle").addEventListener("click", () => {
+  state.eraseMode = !state.eraseMode;
+  showErase();
+});
+$("eraseUndo").addEventListener("click", () => {
+  state.erasePts.pop();
+  showErase();
+  applySource();
+});
+$("eraseClear").addEventListener("click", () => {
+  state.erasePts = [];
+  showErase();
+  applySource();
+});
+$("canvas").addEventListener("click", (e) => {
+  const geo = state.geo, src = state.source;
+  const svg = $("canvas").querySelector("svg");
+  if (!state.eraseMode || !state.removeBg || !geo || !src || !svg) return;
+  const ctm = svg.getScreenCTM();
+  if (!ctm) return;
+  // 画面座標 → SVG(mm) → 画像の画素座標
+  const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse());
+  const x = (p.x / geo.imgWmm) * src.width, y = (p.y / geo.imgHmm) * src.height;
+  if (x < 0 || y < 0 || x >= src.width || y >= src.height) return;
+  state.erasePts.push({ x, y });
+  showErase();
   applySource();
 });
 $<HTMLSelectElement>("cutColor").addEventListener("change", (e) => {

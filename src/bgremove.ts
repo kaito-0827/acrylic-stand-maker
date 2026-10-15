@@ -111,7 +111,31 @@ export function removeBackground(src: Uint8ClampedArray, W: number, H: number, o
     }
   }
 
-  // 3) 背景に接する帯(R画素)を求める
+  // 3-4) 背景に接する帯のα推定と白フチ除去
+  const alpha = bandMatte(d, src, W, H, bgMask, dist, B, tol);
+
+  // 5) JPEGノイズ等の小さな浮島を除去
+  removeIslands(alpha, W, H);
+
+  for (let i = 0; i < N; i++) d[i * 4 + 3] = Math.round(d[i * 4 + 3] * alpha[i]);
+  return { data: d, bg: B };
+}
+
+/**
+ * 背景マスクに接する帯(R画素)の画素について、C = αF + (1-α)B とみなしてαを推定し、
+ * d の色から背景の混ざり(白フチ)を除く。背景マスク内はα=0、帯より内側はα=1
+ */
+function bandMatte(
+  d: Uint8ClampedArray,
+  src: Uint8ClampedArray,
+  W: number,
+  H: number,
+  bgMask: Uint8Array,
+  dist: Float32Array,
+  B: [number, number, number],
+  tol: number,
+): Float32Array {
+  const N = W * H;
   const R = 3;
   const near = new Uint8Array(N).fill(255);
   let q: number[] = [];
@@ -142,9 +166,10 @@ export function removeBackground(src: Uint8ClampedArray, W: number, H: number, o
     q = nq;
   }
 
-  // 4) 帯の画素: C = αF + (1-α)B とみなしてαを推定し、色から背景の混ざり(白フチ)を除く。
+  // 帯の画素: C = αF + (1-α)B とみなしてαを推定し、色から背景の混ざり(白フチ)を除く。
   //    前景色Fは、近くの内側画素のうち「CをBとの混色として最もよく説明できる色」を選ぶ
   const alpha = new Float32Array(N);
+  const [Br, Bg, Bb] = B;
   const S = R + 2;
   const minF = tol * 2;
   for (let i = 0; i < N; i++) {
@@ -190,11 +215,7 @@ export function removeBackground(src: Uint8ClampedArray, W: number, H: number, o
     }
   }
 
-  // 5) JPEGノイズ等の小さな浮島を除去
-  removeIslands(alpha, W, H);
-
-  for (let i = 0; i < N; i++) d[i * 4 + 3] = Math.round(d[i * 4 + 3] * alpha[i]);
-  return { data: d, bg: B };
+  return alpha;
 }
 
 /** α≥0.5 の連結成分のうち、ごく小さいもの(JPEGノイズ等)を透明にする */
@@ -324,4 +345,72 @@ export function borderMatchRatio(d: Uint8ClampedArray, W: number, H: number, B: 
   for (let x = 0; x < W; x++) { test(x); test((H - 1) * W + x); }
   for (let y = 1; y < H - 1; y++) { test(y * W); test(y * W + W - 1); }
   return n ? hit / n : 1;
+}
+
+/**
+ * 指定した点から、その点の色に近い領域を透過する(囲まれた背景をユーザーがクリックで消す用)。
+ * 自動では「すき間から見える背景」と「背景と同じ色の絵柄(目のハイライト等)」を区別できないため。
+ * cur: 現在の透過結果 / src: 元画像。境界は単色モードと同じ方法で白フチを除く
+ */
+export function eraseRegion(
+  cur: Uint8ClampedArray,
+  src: Uint8ClampedArray,
+  W: number,
+  H: number,
+  px: number,
+  py: number,
+  tol: number,
+): Uint8ClampedArray {
+  const N = W * H;
+  px = Math.min(W - 1, Math.max(0, Math.round(px)));
+  py = Math.min(H - 1, Math.max(0, Math.round(py)));
+  // クリック位置周辺の平均色を、その領域の背景色とする(グラデーション背景でも局所的には単色に近い)
+  let n = 0, r = 0, g = 0, b = 0;
+  for (let y = Math.max(0, py - 2); y <= Math.min(H - 1, py + 2); y++) {
+    for (let x = Math.max(0, px - 2); x <= Math.min(W - 1, px + 2); x++) {
+      const i = y * W + x;
+      n++; r += src[i * 4]; g += src[i * 4 + 1]; b += src[i * 4 + 2];
+    }
+  }
+  const B: [number, number, number] = [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+  const dist = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    dist[i] = src[i * 4 + 3] < 8 ? 0 : colorDist(src[i * 4], src[i * 4 + 1], src[i * 4 + 2], B[0], B[1], B[2]);
+  }
+
+  const mask = new Uint8Array(N);
+  const stack = new Int32Array(N);
+  let sp = 0;
+  const seed = py * W + px;
+  mask[seed] = 1;
+  stack[sp++] = seed;
+  while (sp) {
+    const i = stack[--sp];
+    const x = i % W;
+    const nb = [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, i >= W ? i - W : -1, i < N - W ? i + W : -1];
+    for (const j of nb) {
+      if (j >= 0 && !mask[j] && dist[j] < tol) {
+        mask[j] = 1;
+        stack[sp++] = j;
+      }
+    }
+  }
+
+  const fixed = new Uint8ClampedArray(src);
+  const alpha = bandMatte(fixed, src, W, H, mask, dist, B, tol);
+  removeIslands(alpha, W, H);
+  const out = new Uint8ClampedArray(cur);
+  for (let i = 0; i < N; i++) {
+    const a = alpha[i];
+    if (a >= 1) continue;
+    const na = Math.round(src[i * 4 + 3] * a);
+    if (na >= out[i * 4 + 3]) continue;
+    out[i * 4 + 3] = na;
+    if (na > 0) {
+      out[i * 4] = fixed[i * 4];
+      out[i * 4 + 1] = fixed[i * 4 + 1];
+      out[i * 4 + 2] = fixed[i * 4 + 2];
+    }
+  }
+  return out;
 }

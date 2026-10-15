@@ -102,3 +102,11 @@ input[type="range"] { width: 120px; }
 .ai-status.err { color: #d33; }
 .hintbox { font-size: 12px; color: var(--muted); background: color-mix(in srgb, var(--accent) 7%, transparent); border-radius: 6px; padding: 6px 8px; margin: 4px 0; }
 .hintbox button { font-size: 12px; padding: 0 2px; }
+
+.erase { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 8px; }
+.erase .hint { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
+.sub-btn { width: 100%; padding: 7px 8px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); font: inherit; font-size: 13px; cursor: pointer; }
+.sub-btn:hover { border-color: var(--accent); }
+.sub-btn.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-weight: 600; }
+.erase-row { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); }
+.canvas.erasing svg { cursor: crosshair; }
