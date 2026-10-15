@@ -81,3 +81,8 @@ select { width: 150px; text-align: left; }
   .canvas { min-height: 300px; }
 }
 [hidden] { display: none !important; }
+.swatch { width: 44px; height: 22px; border-radius: 5px; border: 1px solid var(--line); font-size: 10px; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
+.check .hint { display: block; color: var(--muted); font-size: 11px; }
+.check:has(.hint) { align-items: flex-start; }
+.check:has(.hint) input { margin-top: 3px; }
+input[type="range"] { width: 120px; }

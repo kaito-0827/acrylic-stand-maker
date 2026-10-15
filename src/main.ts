@@ -1,5 +1,6 @@
 import "./style.css";
 import { buildGeometry, planGrid, type StandGeometry, type StandParams } from "./geometry";
+import { estimateBackground, removeBackground } from "./bgremove";
 import { buildAi, buildEps, loopsToSvgPath, type Cmyk, type ExportOptions, type Raster } from "./export";
 
 // ---------------------------------------------------------------- 状態
@@ -30,8 +31,10 @@ const state = {
   source: null as HTMLCanvasElement | null, // 読み込んだ画像(透過処理後)
   original: null as HTMLCanvasElement | null,
   fileName: "acrylic-stand",
-  removeWhite: false,
-  whiteTolerance: 24,
+  removeBg: false,
+  bgTolerance: 12,
+  removeEnclosed: false,
+  bgColor: null as [number, number, number] | null,
   cutColor: "red",
   cutWidthPt: 0.3,
   includeBase: true,
@@ -88,10 +91,17 @@ app.innerHTML = `
         <div class="drop-sub">背景透過PNG推奨</div>
       </label>
       <button class="link" id="sample" type="button">サンプル画像で試す</button>
-      <label class="check"><input type="checkbox" id="removeWhite" /> 白い背景を透過する</label>
-      <div class="field" id="tolRow" hidden>
-        <span>白判定の許容差</span>
-        <input type="range" id="tol" min="2" max="80" value="24" />
+      <label class="check"><input type="checkbox" id="removeBg" /> 背景を透過する（単色の背景）</label>
+      <div id="bgOpts" hidden>
+        <div class="field">
+          <span>背景色<small>画像の外周から自動判定</small></span>
+          <span class="swatch" id="bgSwatch"></span>
+        </div>
+        <div class="field">
+          <span>許容差<small>背景が残る→上げる／絵柄が欠ける→下げる</small></span>
+          <span class="num"><input type="range" id="tol" min="3" max="40" value="12" /><em id="tolVal">12</em></span>
+        </div>
+        <label class="check"><input type="checkbox" id="removeEnclosed" /><span>囲まれた背景も透過<small class="hint">腕のすき間など。背景と同じ色の服も消えることがあります</small></span></label>
       </div>
       <div id="imgInfo" class="info"></div>
     </section>
@@ -155,46 +165,30 @@ function toCanvas(img: CanvasImageSource, w: number, h: number) {
   return c;
 }
 
-/** 外周とつながった白っぽい画素を透明にする */
-function removeWhiteBackground(src: HTMLCanvasElement, tol: number) {
+/** 単色背景を除去したキャンバスを作る */
+function removeBg(src: HTMLCanvasElement) {
   const c = document.createElement("canvas");
   c.width = src.width;
   c.height = src.height;
   const ctx = c.getContext("2d")!;
   ctx.drawImage(src, 0, 0);
   const id = ctx.getImageData(0, 0, c.width, c.height);
-  const d = id.data;
-  const W = c.width, H = c.height;
-  const lim = 255 - tol;
-  const isBg = (i: number) => d[i * 4 + 3] < 8 || (d[i * 4] >= lim && d[i * 4 + 1] >= lim && d[i * 4 + 2] >= lim);
-  const seen = new Uint8Array(W * H);
-  const stack: number[] = [];
-  const push = (i: number) => {
-    if (!seen[i] && isBg(i)) {
-      seen[i] = 1;
-      stack.push(i);
-    }
-  };
-  for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
-  for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
-  while (stack.length) {
-    const i = stack.pop()!;
-    const x = i % W;
-    if (x > 0) push(i - 1);
-    if (x < W - 1) push(i + 1);
-    if (i >= W) push(i - W);
-    if (i < W * (H - 1)) push(i + W);
-  }
-  for (let i = 0; i < W * H; i++) {
-    if (seen[i]) d[i * 4 + 3] = 0;
-  }
+  const res = removeBackground(id.data, c.width, c.height, { tolerance: state.bgTolerance, removeEnclosed: state.removeEnclosed });
+  id.data.set(res.data);
   ctx.putImageData(id, 0, 0);
   return c;
 }
 
+function showBgOpts() {
+  $("bgOpts").hidden = !state.removeBg;
+  const sw = $("bgSwatch");
+  sw.style.background = state.bgColor ? `rgb(${state.bgColor.join(",")})` : "transparent";
+  sw.textContent = state.bgColor ? "" : "判定できません";
+}
+
 function applySource() {
   if (!state.original) return;
-  state.source = state.removeWhite ? removeWhiteBackground(state.original, state.whiteTolerance) : state.original;
+  state.source = state.removeBg && state.bgColor ? removeBg(state.original) : state.original;
   schedule();
 }
 
@@ -204,14 +198,12 @@ function loadImageFile(file: File) {
   img.onload = () => {
     state.original = toCanvas(img, img.naturalWidth, img.naturalHeight);
     state.fileName = file.name.replace(/\.[^.]+$/, "") || "acrylic-stand";
-    // 透過のないJPEGなどは白背景透過を自動でON
-    const ctx = state.original.getContext("2d")!;
-    const corner = ctx.getImageData(0, 0, 1, 1).data;
-    if (corner[3] === 255 && !state.removeWhite) {
-      state.removeWhite = true;
-      $<HTMLInputElement>("removeWhite").checked = true;
-      $("tolRow").hidden = false;
-    }
+    // 外周が不透明(JPEGなど)なら背景色を推定して透過を自動でON
+    const o = state.original;
+    state.bgColor = estimateBackground(o.getContext("2d")!.getImageData(0, 0, o.width, o.height).data, o.width, o.height);
+    state.removeBg = !!state.bgColor;
+    $<HTMLInputElement>("removeBg").checked = state.removeBg;
+    showBgOpts();
     URL.revokeObjectURL(url);
     applySource();
   };
@@ -276,9 +268,10 @@ function makeSample() {
   g.fill();
   state.original = c;
   state.fileName = "sample";
-  state.removeWhite = false;
-  $<HTMLInputElement>("removeWhite").checked = false;
-  $("tolRow").hidden = true;
+  state.bgColor = null;
+  state.removeBg = false;
+  $<HTMLInputElement>("removeBg").checked = false;
+  showBgOpts();
   applySource();
 }
 
@@ -449,13 +442,24 @@ drop.addEventListener("drop", (e) => {
   if (f) loadImageFile(f);
 });
 $("sample").addEventListener("click", makeSample);
-$<HTMLInputElement>("removeWhite").addEventListener("change", (e) => {
-  state.removeWhite = (e.target as HTMLInputElement).checked;
-  $("tolRow").hidden = !state.removeWhite;
+$<HTMLInputElement>("removeBg").addEventListener("change", (e) => {
+  state.removeBg = (e.target as HTMLInputElement).checked;
+  if (state.removeBg && !state.bgColor && state.original) {
+    const o = state.original;
+    state.bgColor = estimateBackground(o.getContext("2d")!.getImageData(0, 0, o.width, o.height).data, o.width, o.height);
+  }
+  showBgOpts();
   applySource();
 });
-$<HTMLInputElement>("tol").addEventListener("change", (e) => {
-  state.whiteTolerance = +(e.target as HTMLInputElement).value;
+let tolTimer = 0;
+$<HTMLInputElement>("tol").addEventListener("input", (e) => {
+  state.bgTolerance = +(e.target as HTMLInputElement).value;
+  $("tolVal").textContent = String(state.bgTolerance);
+  clearTimeout(tolTimer);
+  tolTimer = window.setTimeout(applySource, 150);
+});
+$<HTMLInputElement>("removeEnclosed").addEventListener("change", (e) => {
+  state.removeEnclosed = (e.target as HTMLInputElement).checked;
   applySource();
 });
 $<HTMLSelectElement>("cutColor").addEventListener("change", (e) => {
